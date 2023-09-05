@@ -7,18 +7,21 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"slices"
 )
 
 type (
 	// EasySlog is a slog handler that reduces the boilerplate of implementing the
 	// slog.Handler boilerplate.
 	EasySlog struct {
-		formatter Formatter
-		leveler   slog.Leveler
-		mu        *sync.Mutex
-		attrs     []Attr
-		groups    []string
-		writer    io.Writer
+		formatter    Formatter
+		leveler      slog.Leveler
+		mu           *sync.Mutex
+		attrs        []Attr
+		writer       io.Writer
+		groupIndices []int
+		root         *Attr
 	}
 
 	// Record is passed to the formatter associated with an EasySlog handler. It
@@ -38,18 +41,7 @@ type (
 		// The message being logged.
 		Message string
 		// The attributes being logged.
-		Attrs []Attr
-	}
-
-	// Attr is a flattened slog attribute where `Keys` is a slice of strings
-	// representing the groups and key of the attribute logged.
-	//
-	// e.g. `slog.WithGroup("outer").Info("hello", slog.Group("inner", "a", b"))` would result in `[]string{"outer", "inner", "a"}`
-	Attr struct {
-		Keys []string
-		// The underlying slog.Value attribute being logged. `Resolve` is
-		// already called on values that implement `slog.LogValuer``.
-		Value slog.Value
+		Attrs []*Attr
 	}
 
 	// Formatter is provided the io.Writer of the handler and the Record for the
@@ -72,14 +64,24 @@ var _ slog.Handler = (*EasySlog)(nil)
 // provided Formatter.
 func New(w io.Writer, formatter Formatter, opts *Options) *EasySlog {
 	if opts == nil {
-		opts = &Options{}
+		opts = &Options{
+			Level: slog.LevelInfo,
+		}
+	}
+
+	root := &Attr{
+		Key:      "",
+		Value:    slog.AnyValue(nil),
+		Children: make([]*Attr, 0),
 	}
 
 	return &EasySlog{
-		writer:    w,
-		formatter: formatter,
-		leveler:   slog.LevelDebug,
-		mu:        &sync.Mutex{},
+		root:         root,
+		writer:       w,
+		formatter:    formatter,
+		leveler:      opts.Level,
+		groupIndices: []int{},
+		mu:           &sync.Mutex{},
 	}
 }
 
@@ -88,23 +90,33 @@ func (handler *EasySlog) Enabled(ctx context.Context, level slog.Level) bool {
 	return level >= handler.leveler.Level()
 }
 
+func (handler *EasySlog) getCurrentGroup(root *Attr) *Attr {
+	group := root
+	for _, i := range handler.groupIndices {
+		group = group.Children[i]
+	}
+
+	return group
+}
+
 // WithAttrs returns a new EasySlog whose attributes are always logged.
 func (handler *EasySlog) WithAttrs(slogAttrs []slog.Attr) slog.Handler {
-	attrs := make([]Attr, 0, len(slogAttrs))
+	root := handler.root.clone()
+
 	for _, attr := range slogAttrs {
 		if attr.Value.Any() == nil {
 			continue
 		}
-		attrs = append(attrs, parseValue(attr, handler.groups)...)
+		parseValue(attr, handler.getCurrentGroup(root))
 	}
 
 	return &EasySlog{
-		writer:    handler.writer,
-		formatter: handler.formatter,
-		leveler:   handler.leveler,
-		mu:        handler.mu,
-		attrs:     append(handler.attrs, attrs...),
-		groups:    handler.groups,
+		writer:       handler.writer,
+		formatter:    handler.formatter,
+		leveler:      handler.leveler,
+		mu:           handler.mu,
+		groupIndices: handler.groupIndices,
+		root:         root,
 	}
 }
 
@@ -115,31 +127,44 @@ func (handler *EasySlog) WithGroup(name string) slog.Handler {
 		return handler
 	}
 
-	groups := append(handler.groups, name)
+	group := &Attr{
+		Key:      name,
+		Value:    slog.AnyValue(nil),
+		Children: make([]*Attr, 0),
+	}
+
+	root := handler.root.clone()
+	currentGroup := handler.getCurrentGroup(root)
+	currentGroup.Children = append(currentGroup.Children, group)
 
 	return &EasySlog{
-		writer:    handler.writer,
-		formatter: handler.formatter,
-		leveler:   handler.leveler,
-		mu:        handler.mu,
-		attrs:     handler.attrs,
-		groups:    groups,
+		writer:       handler.writer,
+		formatter:    handler.formatter,
+		leveler:      handler.leveler,
+		mu:           handler.mu,
+		attrs:        handler.attrs,
+		groupIndices: append(handler.groupIndices, len(currentGroup.Children)-1),
+		root:         root,
 	}
 }
 
 // Handle converts the slog.Record data into an EasySlog.Record, provides it to
 // the formatter, and writes the output to the handlers io.Writer.
 func (handler *EasySlog) Handle(_ context.Context, r slog.Record) error {
-	values := make([]Attr, 0, r.NumAttrs())
-	values = append(values, handler.attrs...)
+	root := handler.root.clone()
+	currentGroup := handler.getCurrentGroup(root)
 
 	r.Attrs(func(a slog.Attr) bool {
-		if a.Value.Any() == nil {
-			return true
-		}
-		values = append(values, parseValue(a, handler.groups)...)
+		parseValue(a, currentGroup)
 		return true
 	})
+
+	prune(root)
+
+	rootAttrs := make([]*Attr, 0, len(root.Children))
+	for _, attr := range root.Children {
+		rootAttrs = append(rootAttrs, attr)
+	}
 
 	var buf bytes.Buffer
 	err := handler.formatter.Format(&buf, Record{
@@ -147,7 +172,7 @@ func (handler *EasySlog) Handle(_ context.Context, r slog.Record) error {
 		PC:      r.PC,
 		Message: r.Message,
 		Level:   r.Level,
-		Attrs:   values,
+		Attrs:   rootAttrs,
 	})
 
 	if err != nil {
@@ -164,23 +189,47 @@ func (handler *EasySlog) Handle(_ context.Context, r slog.Record) error {
 	return err
 }
 
-func parseValue(a slog.Attr, keys []string) []Attr {
-	if a.Key != "" {
-		keys = append(keys, a.Key)
+func parseValue(a slog.Attr, parent *Attr) {
+	if a.Value.Kind() != slog.KindGroup && a.Value.Any() == nil {
+		return
 	}
 
 	if a.Value.Kind() != slog.KindGroup {
-		return []Attr{{
-			Keys:  keys,
+		parent.Children = append(parent.Children, &Attr{
+			Key:   a.Key,
 			Value: a.Value.Resolve(),
-		}}
+		})
+
+		return
 	}
 
-	values := make([]Attr, 0, len(a.Value.Group()))
+	groupAttr := parent
+	isSubgroup := false
+	if a.Key != "" {
+		isSubgroup = true
+		groupAttr = &Attr{
+			Key:      a.Key,
+			Value:    slog.AnyValue(nil),
+			Children: make([]*Attr, 0, len(a.Value.Group())),
+		}
+	}
+
 	for _, attr := range a.Value.Group() {
-		keys := keys
-		values = append(values, parseValue(attr, keys)...)
+		parseValue(attr, groupAttr)
 	}
 
-	return values
+	if isSubgroup && len(groupAttr.Children) != 0 {
+		parent.Children = append(parent.Children, groupAttr)
+	}
+}
+
+func prune(a *Attr) {
+	for i, child := range a.Children {
+		if child.empty() {
+			a.Children = slices.Delete(a.Children, i, i+1)
+			continue
+		}
+
+		prune(child)
+	}
 }
