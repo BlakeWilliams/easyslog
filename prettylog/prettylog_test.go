@@ -16,9 +16,9 @@ func TestFormat(t *testing.T) {
 	handler := easyslog.New(&buf, Formatter{}, nil)
 	l := slog.New(handler)
 
-	l.Debug("omg", "foo", "bar", "baz", "quux")
+	l.Info("omg", "foo", "bar", "baz", "quux")
 
-	require.Equal(t, "[DBG] omg foo=bar baz=quux\n", buf.String())
+	require.Equal(t, "[INF] omg foo=bar baz=quux \n", buf.String())
 }
 
 func TestColorDisabled(t *testing.T) {
@@ -31,9 +31,9 @@ func TestColorDisabled(t *testing.T) {
 	handler := easyslog.New(&buf, Formatter{NoColor: true}, nil)
 	l := slog.New(handler)
 
-	l.Debug("omg", "foo", "bar", "baz", "quux")
+	l.Info("omg", "foo", "bar", "baz", "quux")
 
-	require.Equal(t, "[DBG] omg foo=bar baz=quux\n", buf.String())
+	require.Equal(t, "[INF] omg foo=bar baz=quux \n", buf.String())
 }
 
 func TestUnknownLogLevels(t *testing.T) {
@@ -43,5 +43,15 @@ func TestUnknownLogLevels(t *testing.T) {
 
 	l.Log(context.Background(), 7, "omg", "foo", "bar", "baz", "quux")
 
-	require.Equal(t, "[UNK] omg foo=bar baz=quux\n", buf.String())
+	require.Equal(t, "[UNK] omg foo=bar baz=quux \n", buf.String())
+}
+
+func TestGroups(t *testing.T) {
+	var buf bytes.Buffer
+	handler := easyslog.New(&buf, Formatter{}, nil)
+	l := slog.New(handler)
+
+	l.Info("msg", slog.Group("request", "method", "get", "path", "/"))
+
+	require.Equal(t, "[INF] msg request.method=get request.path=/ \n", buf.String())
 }

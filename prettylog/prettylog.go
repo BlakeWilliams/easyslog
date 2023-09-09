@@ -57,15 +57,24 @@ func (f Formatter) Format(w io.Writer, record easyslog.Record) error {
 	_, _ = w.Write([]byte(record.Message))
 	_, _ = w.Write([]byte(" "))
 
-	for i, attr := range record.Attrs {
-		key := strings.Join(attr.Keys, ".")
-		c.Fprint(w, key)
-		_, _ = w.Write([]byte("="))
-		_, _ = w.Write([]byte(attr.Value.String()))
-		if i != len(record.Attrs)-1 {
-			_, _ = w.Write([]byte(" "))
-		}
+	for _, attr := range record.Attrs {
+		f.formatAttr(w, c, attr, []string{})
 	}
 
 	return nil
+}
+
+func (f Formatter) formatAttr(w io.Writer, c *color.Color, attr *easyslog.Attr, parentKeys []string) {
+	if attr.IsGroup() {
+		for _, child := range attr.Children {
+			f.formatAttr(w, c, child, append(parentKeys, attr.Key))
+		}
+		return
+	}
+
+	key := strings.Join(append(parentKeys, attr.Key), ".")
+	c.Fprint(w, key)
+	_, _ = w.Write([]byte("="))
+	_, _ = w.Write([]byte(attr.Value.String()))
+	_, _ = w.Write([]byte(" "))
 }
